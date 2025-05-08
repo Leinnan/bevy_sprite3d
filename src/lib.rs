@@ -256,7 +256,7 @@ fn finish_billboards(
     images: Res<Assets<Image>>,
     layouts: Res<Assets<TextureAtlasLayout>>,
     mut billboards: ResMut<Assets<Billboard>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut _materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut waiting_list: ResMut<WaitingForLoad>,
     mut sprite_query: Query<(
@@ -286,7 +286,7 @@ fn finish_billboards(
             },
         }
 
-        let (mut mesh_3d, mut material_3d, billboard_3d, sprite_3d) =
+        let (mut mesh_3d, mut _material_3d, billboard_3d, sprite_3d) =
             sprite_query.get_mut(entity).unwrap();
         let billboard = billboards.get_mut(&billboard_3d.0).unwrap();
 
@@ -369,13 +369,6 @@ fn finish_billboards(
                 **mesh_3d = mesh_list[atlas.index].clone();
             },
         }
-
-        // Create a copy of the `StandardMaterial` associated with the entity,
-        // attach the image stored in the `Billboard`, then replace the handle
-        // stored in the `MeshMaterial3d`.
-        let mut new_material = materials.get_mut(&**material_3d).unwrap().clone();
-        new_material.base_color_texture = Some(billboard.image.clone());
-        **material_3d = materials.add(new_material);
     }
 
     **waiting_list = still_waiting;
