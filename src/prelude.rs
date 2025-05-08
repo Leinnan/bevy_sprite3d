@@ -1,7 +1,6 @@
 pub use crate::{
+    Billboard,
     Sprite3d,
-    Sprite3dBuilder,
-    Sprite3dBundle,
-    Sprite3dParams,
     Sprite3dPlugin,
+    Sprite3dBillboard,
 };
