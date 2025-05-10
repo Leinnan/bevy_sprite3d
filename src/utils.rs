@@ -1,7 +1,4 @@
-use bevy::{
-    prelude::*,
-    render::render_resource::Face,
-};
+use bevy::{prelude::*, render::render_resource::Face};
 
 /// Returns a [StandardMaterial] with useful defaults for a 3D sprite. Useful if
 /// creating your own `StandardMaterial`.

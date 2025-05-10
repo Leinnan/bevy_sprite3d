@@ -1,12 +1,4 @@
-use bevy::{
-    asset::WaitForAssetError,
-    ecs::{
-        component::HookContext,
-        world::DeferredWorld,
-    },
-    prelude::*,
-    tasks::{block_on, poll_once, IoTaskPool, Task}
-};
+use bevy::{ecs::system::SystemParam, prelude::*};
 use uuid::Uuid;
 
 const DEFAULT_MATERIAL_ID: Uuid = Uuid::from_u128(0xb4c3caf5ead145b985d10d8a5fc676d5_u128);
@@ -21,70 +13,80 @@ pub struct Sprite3dPlugin;
 
 impl Plugin for Sprite3dPlugin {
     fn build(&self, app: &mut App) {
-        app
-            .init_resource::<WaitingForLoad>()
-            .register_type::<Sprite3dBillboard>()
-            .init_resource::<Assets<Billboard>>()
-            .add_systems(Startup, default_material)
-            .add_systems(PreUpdate, finish_billboards)
-            .add_systems(PostUpdate, handle_texture_atlases);
+        app.register_type::<Sprite3dBillboard>()
+            .register_type::<BillboardAssetLoaded>()
+            .add_event::<BillboardAssetLoaded>()
+            .register_type::<Billboard>()
+            .init_asset::<Billboard>()
+            .add_systems(Startup, setup)
+            .add_systems(
+                PostUpdate,
+                (handle_texture_atlases, finish_billboards_loading),
+            );
     }
 }
 
-fn default_material(mut standard_materials: ResMut<Assets<StandardMaterial>>) {
+#[derive(Event, Default, Reflect)]
+pub struct BillboardAssetLoaded;
+
+fn setup(mut standard_materials: ResMut<Assets<StandardMaterial>>, mut commands: Commands) {
     standard_materials.insert(
-        AssetId::Uuid { uuid: DEFAULT_MATERIAL_ID },
+        AssetId::Uuid {
+            uuid: DEFAULT_MATERIAL_ID,
+        },
         utils::material(),
     );
+    commands.spawn((
+        Name::new("BillboardAssetsObserver"),
+        children![
+            Observer::new(update_billboard_mesh::<BillboardAssetLoaded, ()>),
+            Observer::new(update_billboard_mesh::<OnInsert, Sprite3dBillboard>)
+        ],
+    ));
 }
 
 // Update the mesh of a Sprite3d with an texture atlas when its index changes.
 fn handle_texture_atlases(
     billboards: Res<Assets<Billboard>>,
-    mut query: Query<(&mut Mesh3d, &Sprite3d, &Sprite3dBillboard), Changed<Sprite3d>>,
+    mut query: Query<
+        (&mut Mesh3d, Option<&Sprite3dAtlasIndex>, &Sprite3dBillboard),
+        Or<(Changed<Sprite3dAtlasIndex>, Changed<Sprite3dBillboard>)>,
+    >,
 ) {
-    for (mut mesh, sprite_3d, billboard_3d) in query.iter_mut() {
-        let Some(texture_atlas) = &sprite_3d.texture_atlas else {
+    for (mut component_mesh, atlas, billboard_3d) in query.iter_mut() {
+        let Some(billboard) = billboards.get(&**billboard_3d) else {
             continue;
         };
-
-        let billboard = billboards.get(&billboard_3d.0).unwrap();
-        let BillboardKind::Atlas { mesh_list, .. } = &billboard.kind else {
-            panic!("attempted to apply TextureAtlas, but the billboard is not associated with one");
-        };
-
-        if !mesh_list.is_empty() {
-            **mesh = mesh_list[texture_atlas.index].clone();
+        match &billboard.kind {
+            BillboardKind::Single { mesh } => {
+                **component_mesh = mesh.clone();
+            }
+            BillboardKind::Atlas { mesh_list, .. } => {
+                let Some(texture_atlas) = atlas else {
+                    continue;
+                };
+                if let Some(mesh) = mesh_list.get(**texture_atlas) {
+                    **component_mesh = mesh.clone();
+                }
+            }
         }
     }
 }
 
-/// Represents a 3D sprite.
-#[derive(Clone, Default, Component, Reflect)]
+/// Represents a index of Texture Atlas used by billboard.
+#[derive(Clone, Default, Component, Reflect, Debug, Deref, DerefMut)]
+#[reflect(Component)]
 #[require(Sprite3dBillboard)]
-pub struct Sprite3d {
-    /// Holds texture atlas data for the sprite. The layout must match the corresponding
-    /// layout stored in the [Billboard] at the risk of causing bugs or panics.
-    pub texture_atlas: Option<TextureAtlas>,
-}
+pub struct Sprite3dAtlasIndex(pub usize);
 
-impl Sprite3d {
-    /// Create a new `Sprite3d`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl From<TextureAtlas> for Sprite3d {
-    fn from(atlas: TextureAtlas) -> Self {
-        Self {
-            texture_atlas: Some(atlas),
-        }
+impl From<&TextureAtlas> for Sprite3dAtlasIndex {
+    fn from(value: &TextureAtlas) -> Self {
+        Self(value.index)
     }
 }
 
 // Defines whether the billboard stores a single image or a texture atlas.
-#[derive(Clone)]
+#[derive(Clone, Reflect, Debug)]
 enum BillboardKind {
     Single {
         mesh: Handle<Mesh>,
@@ -92,17 +94,11 @@ enum BillboardKind {
     Atlas {
         mesh_list: Vec<Handle<Mesh>>,
         layout: Handle<TextureAtlasLayout>,
-    }
+    },
 }
 
-// stores entities whose billboards are potentially waiting for their image
-// to load
-#[derive(Resource, Deref, DerefMut, Default)]
-struct WaitingForLoad(Vec<(Entity, Task<Result<(), WaitForAssetError>>)>);
-
 #[derive(Clone, Component, Deref, Default, Reflect)]
-#[require(Transform, Mesh3d, MeshMaterial3d<StandardMaterial> = set_material())]
-#[component(on_insert = add_to_waiting_list)]
+#[require(Transform, MeshMaterial3d<StandardMaterial> = set_material())]
 /// Holds the [Billboard] associated with a [Sprite3d]. Has no effect if inserted
 /// into an entity without the `Sprite3d` component. The inner `Handle<Billboard>` is
 /// private to prevent direct modification, but can be read through dereference.
@@ -131,9 +127,36 @@ fn set_material() -> MeshMaterial3d<StandardMaterial> {
     }))
 }
 
+#[derive(SystemParam)]
+pub struct Billboards<'w> {
+    pub billboards: Res<'w, Assets<Billboard>>,
+    pub layouts: Res<'w, Assets<TextureAtlasLayout>>,
+}
+
+impl Billboards<'_> {
+    pub fn textures_len(&self, id: AssetId<Billboard>) -> Option<usize> {
+        let Some(billboard) = self.billboards.get(id) else {
+            return None;
+        };
+        match &billboard.kind {
+            BillboardKind::Single { .. } => Some(1),
+            BillboardKind::Atlas {
+                mesh_list: _,
+                layout,
+            } => {
+                if let Some(ll) = self.layouts.get(layout.id()) {
+                    Some(ll.textures.len())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Represents the "billboard", a flat rectangular 3D mesh that the sprite is
 /// displayed on. Attached onto a sprite with the [Sprite3dBillboard] component.
-#[derive(Clone, Asset, TypePath)]
+#[derive(Clone, Asset, Reflect, Debug)]
 pub struct Billboard {
     // The image associated with the billboard.
     #[dependency]
@@ -143,7 +166,7 @@ pub struct Billboard {
     pixels_per_metre: f32,
     pivot: Vec2,
     double_sided: bool,
-    rendered: bool,
+    material: Handle<StandardMaterial>,
 }
 
 impl Billboard {
@@ -193,6 +216,25 @@ impl Billboard {
             ..default()
         }
     }
+
+    pub fn try_get_mesh(
+        &self,
+        optional_index: Option<&Sprite3dAtlasIndex>,
+    ) -> Option<Handle<Mesh>> {
+        match &self.kind {
+            BillboardKind::Single { mesh } => Some(mesh.clone()),
+            BillboardKind::Atlas { mesh_list, .. } => {
+                let Some(index) = optional_index else {
+                    return None;
+                };
+                if let Some(mesh) = mesh_list.get(**index) {
+                    Some(mesh.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 impl Default for Billboard {
@@ -205,17 +247,16 @@ impl Default for Billboard {
             pixels_per_metre: 100.,
             pivot: Vec2::splat(0.5),
             double_sided: true,
-            rendered: false,
+            material: Handle::Weak(AssetId::Uuid {
+                uuid: DEFAULT_MATERIAL_ID,
+            }),
         }
     }
 }
 
 impl From<Handle<Image>> for Billboard {
     fn from(image: Handle<Image>) -> Self {
-        Self {
-            image,
-            ..default()
-        }
+        Self { image, ..default() }
     }
 }
 
@@ -232,144 +273,135 @@ impl From<(Handle<Image>, Handle<TextureAtlasLayout>)> for Billboard {
     }
 }
 
-// Creates a task to finish constructing the billboard after the image loads,
-// if it hasn't already been loaded.
-fn add_to_waiting_list(mut world: DeferredWorld, context: HookContext) {
-    let task_pool = IoTaskPool::get();
-    let asset_server = world.resource::<AssetServer>().clone();
-    let billboard_h = world.get::<Sprite3dBillboard>(context.entity).unwrap();
-    let billboard = world.resource::<Assets<Billboard>>().get(&**billboard_h).unwrap();
-    let image_h = billboard.image.clone();
+fn finish_billboards_loading(
+    mut asset_events: EventReader<AssetEvent<Billboard>>,
+    layouts: Res<Assets<TextureAtlasLayout>>,
+    images: Res<Assets<Image>>,
+    mut billboards: ResMut<Assets<Billboard>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    q: Query<(Entity, &Sprite3dBillboard)>,
+    mut commands: Commands,
+) {
+    for e in asset_events.read() {
+        let id = match e {
+            AssetEvent::Added { id } => id,
+            // AssetEvent::Modified { id } => id,
+            _ => continue,
+        };
+        let Some(billboard) = billboards.get_mut(*id) else {
+            continue;
+        };
+        let Some(image) = images.get(&billboard.image) else {
+            continue;
+        };
+        let image_size = image.texture_descriptor.size;
+        match &billboard.kind {
+            BillboardKind::Single { mesh: _ } => {
+                // w & h are the world-space size of the sprite
+                let w = (image_size.width as f32) / billboard.pixels_per_metre;
+                let h = (image_size.height as f32) / billboard.pixels_per_metre;
 
-    let task = task_pool.spawn(async move {
-        asset_server.wait_for_asset(&image_h).await
-    });
+                let new_mesh = quad::quad(w, h, billboard.pivot, billboard.double_sided);
+                let mesh_handle = meshes.add(new_mesh.clone());
+                billboard.kind = BillboardKind::Single { mesh: mesh_handle };
+            }
+            BillboardKind::Atlas {
+                mesh_list: _,
+                layout: layout_handle,
+            } => {
+                let layout = layouts.get(layout_handle).unwrap();
+                billboard.kind = BillboardKind::Atlas {
+                    mesh_list: layout
+                        .textures
+                        .iter()
+                        .map(|rect| {
+                            let w = rect.width() as f32 / billboard.pixels_per_metre;
+                            let h = rect.height() as f32 / billboard.pixels_per_metre;
 
-    world.resource_mut::<WaitingForLoad>().push((context.entity, task));
+                            let frac_rect = bevy::math::Rect {
+                                min: Vec2::new(
+                                    rect.min.x as f32 / (image_size.width as f32),
+                                    rect.min.y as f32 / (image_size.height as f32),
+                                ),
+                                max: Vec2::new(
+                                    rect.max.x as f32 / (image_size.width as f32),
+                                    rect.max.y as f32 / (image_size.height as f32),
+                                ),
+                            };
+
+                            // scale pivot to be relative to the rect within the atlas
+                            let mut rect_pivot = billboard.pivot;
+                            rect_pivot.x *= frac_rect.width();
+                            rect_pivot.y *= frac_rect.height();
+                            rect_pivot += frac_rect.min;
+
+                            let mut mesh =
+                                quad::quad(w, h, billboard.pivot, billboard.double_sided);
+                            mesh.insert_attribute(
+                                Mesh::ATTRIBUTE_UV_0,
+                                vec![
+                                    [frac_rect.min.x, frac_rect.max.y],
+                                    [frac_rect.max.x, frac_rect.max.y],
+                                    [frac_rect.min.x, frac_rect.min.y],
+                                    [frac_rect.max.x, frac_rect.min.y],
+                                    [frac_rect.min.x, frac_rect.max.y],
+                                    [frac_rect.max.x, frac_rect.max.y],
+                                    [frac_rect.min.x, frac_rect.min.y],
+                                    [frac_rect.max.x, frac_rect.min.y],
+                                ],
+                            );
+
+                            meshes.add(mesh)
+                        })
+                        .collect(),
+                    layout: layout_handle.clone(),
+                };
+            }
+        }
+        billboard.material = materials.add(StandardMaterial {
+            base_color_texture: billboard.image.clone().into(),
+            ..utils::material()
+        });
+        // error!("billboard: {:#?}", &billboard);
+        let ids: Vec<Entity> = q
+            .iter()
+            .flat_map(
+                |(e, handle)| {
+                    if id.eq(&handle.id()) {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect();
+        commands.trigger_targets(BillboardAssetLoaded, ids);
+    }
 }
 
-
-// Finishes rendering the `Billboard` and transferring the associated data to the entity
-// as each image in `WaitingForLoad` finishes loading.
-#[allow(clippy::too_many_arguments)]
-fn finish_billboards(
-    images: Res<Assets<Image>>,
-    layouts: Res<Assets<TextureAtlasLayout>>,
-    mut billboards: ResMut<Assets<Billboard>>,
-    mut _materials: ResMut<Assets<StandardMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut waiting_list: ResMut<WaitingForLoad>,
-    mut sprite_query: Query<(
-        &mut Mesh3d,
-        &mut MeshMaterial3d<StandardMaterial>,
+fn update_billboard_mesh<T: Event, B: Bundle>(
+    trigger: Trigger<T, B>,
+    mut q: Query<(
+        Entity,
         &Sprite3dBillboard,
-        &Sprite3d,
+        Option<&Sprite3dAtlasIndex>,
+        &mut MeshMaterial3d<StandardMaterial>,
     )>,
+    billboards: Res<Assets<Billboard>>,
+    mut commands: Commands,
 ) {
-    let mut still_waiting = Vec::new();
+    let Ok((e, handle, atlas, mut material)) = q.get_mut(trigger.target()) else {
+        return;
+    };
 
-    for (entity, task) in waiting_list.drain(..) {
-        // If the image is still unloaded, defer until later.
-        if !task.is_finished() {
-            still_waiting.push((entity, task));
-            continue;
-        }
+    let Some(billboard) = billboards.get(&**handle) else {
+        return;
+    };
+    material.set_if_neq(billboard.material.clone().into());
 
-        match block_on(poll_once(task)).unwrap() {
-            Ok(()) => (),
-            Err(asset_error) => {
-                // should this be a logged error instead?
-                panic!(
-                    "Failed to load image while making bevy_sprite3d::Billboard: {}",
-                    asset_error,
-                );
-            },
-        }
-
-        let (mut mesh_3d, mut _material_3d, billboard_3d, sprite_3d) =
-            sprite_query.get_mut(entity).unwrap();
-        let billboard = billboards.get_mut(&billboard_3d.0).unwrap();
-
-        // If the `Billboard` has not yet had its associated mesh(es) created,
-        // then we do so here. This prevents unneceessary work if the same
-        // `Billboard` is used multiple times.
-        if !billboard.rendered {
-            let image = images.get(&billboard.image).unwrap();
-            let image_size = image.texture_descriptor.size;
-
-            match &mut billboard.kind {
-                BillboardKind::Single { mesh } => {
-                    // w & h are the world-space size of the sprite
-                    let w = (image_size.width as f32) / billboard.pixels_per_metre;
-                    let h = (image_size.height as f32) / billboard.pixels_per_metre;
-
-                    let new_mesh =
-                        quad::quad(w, h, billboard.pivot, billboard.double_sided);
-                    let mesh_handle = meshes.add(new_mesh.clone());
-                    *mesh = mesh_handle;
-                },
-                BillboardKind::Atlas { mesh_list, layout } => {
-                    let layout = layouts.get(layout).unwrap();
-                    *mesh_list = layout.textures.iter().map(|rect| {
-                        let w = rect.width() as f32 / billboard.pixels_per_metre;
-                        let h = rect.height() as f32 / billboard.pixels_per_metre;
-
-                        let frac_rect = bevy::math::Rect {
-                            min: Vec2::new(
-                                rect.min.x as f32 / (image_size.width as f32),
-                                rect.min.y as f32 / (image_size.height as f32),
-                            ),
-                            max: Vec2::new(
-                                rect.max.x as f32 / (image_size.width as f32),
-                                rect.max.y as f32 / (image_size.height as f32),
-                            ),
-                        };
-
-                        // scale pivot to be relative to the rect within the atlas
-                        let mut rect_pivot = billboard.pivot;
-                        rect_pivot.x *= frac_rect.width();
-                        rect_pivot.y *= frac_rect.height();
-                        rect_pivot += frac_rect.min;
-
-                        let mut mesh =
-                            quad::quad(w, h, billboard.pivot, billboard.double_sided);
-                        mesh.insert_attribute(
-                            Mesh::ATTRIBUTE_UV_0,
-                            vec![
-                                [frac_rect.min.x, frac_rect.max.y],
-                                [frac_rect.max.x, frac_rect.max.y],
-                                [frac_rect.min.x, frac_rect.min.y],
-                                [frac_rect.max.x, frac_rect.min.y],
-
-                                [frac_rect.min.x, frac_rect.max.y],
-                                [frac_rect.max.x, frac_rect.max.y],
-                                [frac_rect.min.x, frac_rect.min.y],
-                                [frac_rect.max.x, frac_rect.min.y],
-                            ]
-                        );
-
-                        meshes.add(mesh)
-                    }).collect();
-                },
-            }
-
-            billboard.rendered = true;
-        }
-
-        // Replace the `Handle<Mesh>` stored in `Mesh3d` with the one
-        // stored in the `Billboard`.
-        match &billboard.kind {
-            BillboardKind::Single { mesh } => {
-                **mesh_3d = mesh.clone();
-            },
-            BillboardKind::Atlas { mesh_list, .. } => {
-                let atlas = sprite_3d.texture_atlas
-                    .as_ref()
-                    .expect("missing texture atlas in Sprite3d");
-                **mesh_3d = mesh_list[atlas.index].clone();
-            },
-        }
-    }
-
-    **waiting_list = still_waiting;
+    let Some(mesh) = billboard.try_get_mesh(atlas) else {
+        return;
+    };
+    commands.entity(e).insert(Mesh3d(mesh));
 }

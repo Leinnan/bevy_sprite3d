@@ -24,11 +24,12 @@ fn setup(
     };
 
     // Spawn the camera
-    commands.spawn(Camera3d::default()).insert(Transform::from_xyz(0., 0., 5.));
+    commands
+        .spawn(Camera3d::default())
+        .insert(Transform::from_xyz(0., 0., 5.));
 
     // Spawn a 3D sprite
     commands.spawn((
-        Sprite3d::default(),
         Sprite3dBillboard::from(billboards.add(billboard)),
         MeshMaterial3d(materials.add(material)),
     ));

@@ -52,7 +52,7 @@ fn setup(
 
     // ----------------------- Single Static Sprite ----------------------------
 
-    commands.spawn(Sprite3d {
+    commands.spawn(Sprite3dAtlasIndex {
             image: images.sprite.clone(),
 
             pixels_per_metre: 400.,
@@ -76,7 +76,7 @@ fn setup(
         index: 3,
     };
 
-    commands.spawn(Sprite3d {
+    commands.spawn(Sprite3dAtlasIndex {
             image: images.sprite_sheet.clone(),
 
             pixels_per_metre: 32.,

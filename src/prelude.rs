@@ -1,6 +1,1 @@
-pub use crate::{
-    Billboard,
-    Sprite3d,
-    Sprite3dPlugin,
-    Sprite3dBillboard,
-};
+pub use crate::{Billboard, Sprite3dAtlasIndex, Sprite3dBillboard, Sprite3dPlugin};
